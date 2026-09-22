@@ -75,7 +75,7 @@ def timer_trigger_http(myTimer: func.TimerRequest) -> None:
     )
 
     parametros = {
-        "name": "Felipe"
+        "name": "Felipe Vieira"
     }
 
     try:
