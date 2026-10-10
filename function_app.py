@@ -2,91 +2,63 @@ import logging
 import os 
 import requests
 import azure.functions as func
+import pyodbc
 
 app = func.FunctionApp()
 
-def teste():
-    logging.info('TESTANDO 1234')
 
-@app.timer_trigger(schedule="0 */5 * * * *", arg_name="myTimer", run_on_startup=False,
-              use_monitor=False) 
-def timer_trigger_5min(myTimer: func.TimerRequest) -> None:
-    if myTimer.past_due:
-        logging.info('The timer is past due!')
+@app.function_name(name="extract_chamado")
+@app.timer_trigger(
+    schedule="0 * * * * *",
+    arg_name="myTimer",
+    run_on_startup=False,
+    use_monitor=False
+)
+def extract_chamado(myTimer: func.TimerRequest) -> None:
 
-    logging.info('Python timer trigger function executed.')
+    logging.info("Iniciando leitura da tabela itsm.chamado")
 
-    teste()
+    # Recupera as credenciais das variáveis de ambiente
+    sql_server = os.getenv("HOST")
+    sql_database = os.getenv("DATABASE")
+    sql_user = os.getenv("USER")
+    sql_pass = os.getenv("PASSWORD")
 
-@app.timer_trigger(schedule="0 */3 * * * *", arg_name="myTimer", run_on_startup=False,
-              use_monitor=False) 
-def timer_trigger_3min(myTimer: func.TimerRequest) -> None:
-    if myTimer.past_due:
-        logging.info('The timer is past due!')
-
-    logging.info('Python timer trigger function executed.')
-
-    teste()
-
-@app.timer_trigger(schedule="0 */1 * * * *", arg_name="myTimer", run_on_startup=False,
-              use_monitor=False) 
-def timer_trigger_1min(myTimer: func.TimerRequest) -> None:
-    
-    if myTimer.past_due:
-        logging.info('The timer is past due!')
-
-    logging.info('Python timer trigger function executed.')
-
-    teste()
-
-@app.route(route="http_trigger", auth_level=func.AuthLevel.ANONYMOUS)
-def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info('Python HTTP trigger function processed a request.')
-
-    name = req.params.get('name')
-    if not name:
-        try:
-            req_body = req.get_json()
-        except ValueError:
-            pass
-        else:
-            name = req_body.get('name')
-
-    if name:
-        return func.HttpResponse(f"Hello, {name}. This HTTP triggered function executed successfully.")
-    else:
-        return func.HttpResponse(
-             "This HTTP triggered function executed successfully. Pass a name in the query string or in the request body for a personalized response.",
-             status_code=200
-        )
-
-
-
-
-@app.timer_trigger(schedule="0 */1 * * * *", arg_name="myTimer", run_on_startup=False,
-              use_monitor=False) 
-def timer_trigger_http(myTimer: func.TimerRequest) -> None:
-    
-    logging.info("Timer iniciando chamada HTTP.")
-
-    url = os.getenv(
-        "HTTP_FUNCTION_URL",
-        "https://funcapp-felipem001-dcffeggwefc8faff.canadacentral-01.azurewebsites.net/api/http_trigger"
+    # String de conexão com SQL Server
+    conn_str = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={sql_server};"
+        f"DATABASE={sql_database};"
+        f"UID={sql_user};"
+        f"PWD={sql_pass};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+        "Connection Timeout=30;"
     )
 
-    parametros = {
-        "name": "Felipe Vieira"
-    }
-
     try:
-        resposta = requests.get(
-            url,
-            params=parametros,
-            timeout=30
+        # Abre conexão com o banco
+        with pyodbc.connect(conn_str) as conn:
+
+            cursor = conn.cursor()
+
+            # Consulta a tabela escolhida
+            query = "SELECT * FROM itsm.chamado"
+
+            cursor.execute(query)
+
+            rows = cursor.fetchall()
+
+            # Mostra os dados encontrados
+            for row in rows:
+                logging.info(row)
+
+            logging.info(
+                f"Consulta concluída. Registros encontrados: {len(rows)}"
+            )
+
+    except Exception as e:
+        logging.error(
+            f"Erro ao ler a tabela itsm.chamado: {str(e)}"
         )
-
-        logging.info(f"Status HTTP: {resposta.status_code}")
-        logging.info(f"Resposta da Function: {resposta.text}")
-
-    except requests.RequestException as erro:
-        logging.error(f"Erro ao chamar a HTTP Function: {erro}")
+        raise
