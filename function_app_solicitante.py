@@ -1,28 +1,28 @@
 import logging
-import os 
-import requests
+import os
+
 import azure.functions as func
 import pyodbc
 
 app = func.FunctionApp()
 
 
-@app.function_name(name="extract_chamado")
+@app.function_name(name="extract_solicitante")
 @app.timer_trigger(
     schedule="0 * * * * *",
     arg_name="myTimer",
     run_on_startup=False,
     use_monitor=False
 )
-def extract_chamado(myTimer: func.TimerRequest) -> None:
+def extract_solicitante(myTimer: func.TimerRequest) -> None:
 
-    logging.info("Iniciando leitura da tabela itsm.chamado")
+    logging.info("Iniciando leitura da tabela itsm.solicitante")
 
     # Recupera as credenciais das variáveis de ambiente
-    sql_server = os.getenv("HOST")
-    sql_database = os.getenv("DATABASE")
-    sql_user = os.getenv("USER")
-    sql_pass = os.getenv("PASSWORD")
+    sql_server = os.environ["SQL_HOST"]
+    sql_database = os.environ["SQL_DATABASE"]
+    sql_user = os.environ["SQL_USER"]
+    sql_pass = os.environ["SQL_PASSWORD"]
 
     # String de conexão com SQL Server
     conn_str = (
@@ -43,14 +43,14 @@ def extract_chamado(myTimer: func.TimerRequest) -> None:
             cursor = conn.cursor()
 
             # Consulta a tabela escolhida
-            query = "SELECT * FROM itsm.chamado"
+            query = "SELECT * FROM itsm.solicitante"
 
             cursor.execute(query)
 
             rows = cursor.fetchall()
 
-            # Mostra os dados encontrados
-            for row in rows:
+            # Mostra uma amostra dos dados encontrados (5 primeiros)
+            for row in rows[:5]:
                 logging.info(row)
 
             logging.info(
@@ -59,6 +59,6 @@ def extract_chamado(myTimer: func.TimerRequest) -> None:
 
     except Exception as e:
         logging.error(
-            f"Erro ao ler a tabela itsm.chamado: {str(e)}"
+            f"Erro ao ler a tabela itsm.solicitante: {str(e)}"
         )
         raise
