@@ -4,3 +4,4 @@
 
 azure-functions
 mssql-python
+azure-storage-file-datalake
