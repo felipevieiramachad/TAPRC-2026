@@ -37,6 +37,27 @@ def conectar_banco():
     )
 
 
+def conectar_banco_destino():
+    sql_server = os.getenv("DEST_SQL_HOST")
+    sql_database = os.getenv("DEST_SQL_DATABASE")
+    sql_user = os.getenv("DEST_SQL_USER")
+    sql_pass = os.getenv("DEST_SQL_PASSWORD")
+
+    if not all([sql_server, sql_database, sql_user, sql_pass]):
+        raise RuntimeError(
+            "Uma ou mais variáveis do banco de destino não foram encontradas."
+        )
+
+    return mssql_python.connect(
+        server=sql_server,
+        database=sql_database,
+        uid=sql_user,
+        pwd=sql_pass,
+        encrypt="yes",
+        trust_server_certificate="no",
+    )
+
+
 # =========================================================
 # DATA LAKE - BRONZE
 # =========================================================
@@ -97,6 +118,432 @@ def salvar_json_bronze(entidade, columns, rows):
     )
 
     return f"bronze/{diretorio}/{nome_arquivo}"
+
+
+def ler_ultimo_json_bronze(entidade):
+    connection_string = os.getenv("DATALAKE_CONNECTION_STRING")
+
+    if not connection_string:
+        raise RuntimeError("Variável DATALAKE_CONNECTION_STRING não encontrada.")
+
+    datalake = DataLakeServiceClient.from_connection_string(connection_string)
+
+    file_system = datalake.get_file_system_client("bronze")
+
+    now = datetime.now(timezone.utc)
+
+    diretorio = f"itsm/{entidade}/" f"ano={now:%Y}/" f"mes={now:%m}/" f"dia={now:%d}"
+
+    paths = file_system.get_paths(path=diretorio)
+
+    arquivos = sorted(
+        [
+            path.name
+            for path in paths
+            if not path.is_directory and path.name.endswith(".json")
+        ],
+        reverse=True,
+    )
+
+    if not arquivos:
+        raise RuntimeError(f"Nenhum arquivo encontrado em {diretorio}.")
+
+    for arquivo in arquivos:
+        file_client = file_system.get_file_client(arquivo)
+
+        conteudo = file_client.download_file().readall()
+
+        if not conteudo.strip():
+            logging.warning(
+                "Arquivo vazio ignorado: %s",
+                arquivo,
+            )
+            continue
+
+        try:
+            registros = json.loads(conteudo.decode("utf-8"))
+        except json.JSONDecodeError:
+            logging.warning(
+                "Arquivo JSON inválido ignorado: %s",
+                arquivo,
+            )
+            continue
+
+        logging.info(
+            "%s: %s registros lidos do Bronze",
+            entidade,
+            len(registros),
+        )
+
+        logging.info(
+            "Arquivo utilizado: %s",
+            arquivo,
+        )
+
+        return registros
+
+    raise RuntimeError(f"Nenhum JSON válido encontrado em {diretorio}.")
+
+
+def popular_categoria_destino():
+    registros = ler_ultimo_json_bronze("categorias")
+
+    with conectar_banco_destino() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SET IDENTITY_INSERT dbo.categoria ON")
+
+        try:
+            for registro in registros:
+                cursor.execute(
+                    """
+                    UPDATE dbo.categoria
+                    SET
+                        cd_categoria = ?,
+                        nm_categoria = ?,
+                        ds_descricao = ?,
+                        fl_ativo = ?,
+                        dt_inclusao = ?,
+                        dt_atualizacao = ?,
+                        nm_sistema_origem = ?,
+                        cd_registro_origem = ?
+                    WHERE id_categoria = ?
+                    """,
+                    (
+                        registro["cd_categoria"],
+                        registro["nm_categoria"],
+                        registro["ds_descricao"],
+                        registro["fl_ativo"],
+                        registro["dt_inclusao"],
+                        registro["dt_atualizacao"],
+                        registro["nm_sistema_origem"],
+                        registro["cd_registro_origem"],
+                        registro["id_categoria"],
+                    ),
+                )
+
+                if cursor.rowcount == 0:
+                    cursor.execute(
+                        """
+                        INSERT INTO dbo.categoria (
+                            id_categoria,
+                            cd_categoria,
+                            nm_categoria,
+                            ds_descricao,
+                            fl_ativo,
+                            dt_inclusao,
+                            dt_atualizacao,
+                            nm_sistema_origem,
+                            cd_registro_origem
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            registro["id_categoria"],
+                            registro["cd_categoria"],
+                            registro["nm_categoria"],
+                            registro["ds_descricao"],
+                            registro["fl_ativo"],
+                            registro["dt_inclusao"],
+                            registro["dt_atualizacao"],
+                            registro["nm_sistema_origem"],
+                            registro["cd_registro_origem"],
+                        ),
+                    )
+
+            conn.commit()
+
+        finally:
+            cursor.execute("SET IDENTITY_INSERT dbo.categoria OFF")
+
+        logging.info(
+            "Tabela dbo.categoria atualizada com %s registros",
+            len(registros),
+        )
+
+
+def popular_tabela_destino(
+    entidade_bronze,
+    tabela_destino,
+    chave_primaria,
+    colunas,
+):
+    registros = ler_ultimo_json_bronze(entidade_bronze)
+
+    with conectar_banco_destino() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(f"SET IDENTITY_INSERT dbo.{tabela_destino} ON")
+
+        try:
+            for indice, registro in enumerate(registros, start=1):
+                valor_id = registro[chave_primaria]
+
+                cursor.execute(
+                    f"""
+                    SELECT 1
+                    FROM dbo.{tabela_destino}
+                    WHERE {chave_primaria} = ?
+                    """,
+                    (valor_id,),
+                )
+
+                existe = cursor.fetchone() is not None
+
+                if existe:
+                    colunas_update = [
+                        coluna for coluna in colunas if coluna != chave_primaria
+                    ]
+
+                    set_sql = ", ".join(f"{coluna} = ?" for coluna in colunas_update)
+
+                    valores = [registro[coluna] for coluna in colunas_update]
+
+                    valores.append(valor_id)
+
+                    cursor.execute(
+                        f"""
+                        UPDATE dbo.{tabela_destino}
+                        SET {set_sql}
+                        WHERE {chave_primaria} = ?
+                        """,
+                        tuple(valores),
+                    )
+
+                else:
+                    nomes_colunas = ", ".join(colunas)
+
+                    placeholders = ", ".join("?" for _ in colunas)
+
+                    valores = [registro[coluna] for coluna in colunas]
+
+                    cursor.execute(
+                        f"""
+                        INSERT INTO dbo.{tabela_destino} (
+                            {nomes_colunas}
+                        )
+                        VALUES ({placeholders})
+                        """,
+                        tuple(valores),
+                    )
+
+                if indice % 25 == 0 or indice == len(registros):
+                    logging.info(
+                        "dbo.%s: %s/%s registros processados",
+                        tabela_destino,
+                        indice,
+                        len(registros),
+                    )
+
+            cursor.execute(f"SET IDENTITY_INSERT dbo.{tabela_destino} OFF")
+
+            conn.commit()
+
+        except Exception:
+            conn.rollback()
+            raise
+
+        logging.info(
+            "Tabela dbo.%s atualizada com %s registros",
+            tabela_destino,
+            len(registros),
+        )
+
+
+def popular_todas_tabelas():
+    popular_tabela_destino(
+        "categorias",
+        "categoria",
+        "id_categoria",
+        [
+            "id_categoria",
+            "cd_categoria",
+            "nm_categoria",
+            "ds_descricao",
+            "fl_ativo",
+            "dt_inclusao",
+            "dt_atualizacao",
+            "nm_sistema_origem",
+            "cd_registro_origem",
+        ],
+    )
+
+    popular_tabela_destino(
+        "clientes_organizacao",
+        "cliente_organizacao",
+        "id_cliente_organizacao",
+        [
+            "id_cliente_organizacao",
+            "cd_cliente_organizacao",
+            "nm_cliente_organizacao",
+            "nr_cnpj",
+            "fl_ativo",
+            "dt_inclusao",
+            "dt_atualizacao",
+            "nm_sistema_origem",
+            "cd_registro_origem",
+        ],
+    )
+
+    popular_tabela_destino(
+        "filas",
+        "fila",
+        "id_fila",
+        [
+            "id_fila",
+            "cd_fila",
+            "nm_fila",
+            "ds_descricao",
+            "fl_ativo",
+            "dt_inclusao",
+            "dt_atualizacao",
+            "nm_sistema_origem",
+            "cd_registro_origem",
+        ],
+    )
+
+    popular_tabela_destino(
+        "slas",
+        "sla",
+        "id_sla",
+        [
+            "id_sla",
+            "cd_sla",
+            "nm_sla",
+            "qt_meta_minutos",
+            "ds_descricao",
+            "fl_ativo",
+            "dt_inclusao",
+            "dt_atualizacao",
+            "nm_sistema_origem",
+            "cd_registro_origem",
+        ],
+    )
+
+    popular_tabela_destino(
+        "analistas",
+        "analista",
+        "id_analista",
+        [
+            "id_analista",
+            "cd_analista",
+            "nm_analista",
+            "ds_email",
+            "ds_nivel",
+            "id_fila_atual",
+            "fl_ativo",
+            "dt_inclusao",
+            "dt_atualizacao",
+            "nm_sistema_origem",
+            "cd_registro_origem",
+        ],
+    )
+
+    popular_tabela_destino(
+        "solicitantes",
+        "solicitante",
+        "id_solicitante",
+        [
+            "id_solicitante",
+            "cd_solicitante",
+            "id_cliente_organizacao",
+            "nm_solicitante",
+            "ds_email",
+            "ds_telefone",
+            "fl_ativo",
+            "dt_inclusao",
+            "dt_atualizacao",
+            "nm_sistema_origem",
+            "cd_registro_origem",
+        ],
+    )
+
+    popular_tabela_destino(
+        "chamados",
+        "chamado",
+        "id_chamado",
+        [
+            "id_chamado",
+            "nr_chamado",
+            "ds_tipo_chamado",
+            "ds_status_chamado",
+            "ds_prioridade",
+            "dt_criacao",
+            "dt_resolucao",
+            "dt_ultima_atualizacao",
+            "id_analista_atual",
+            "id_reporter",
+            "id_categoria",
+            "id_cliente_organizacao",
+            "id_fila_atual",
+            "ds_titulo",
+            "ds_descricao",
+            "dt_inclusao",
+            "dt_atualizacao",
+            "nm_sistema_origem",
+            "cd_registro_origem",
+        ],
+    )
+
+    popular_tabela_destino(
+        "chamados_sla",
+        "chamado_sla",
+        "id_chamado_sla",
+        [
+            "id_chamado_sla",
+            "id_chamado",
+            "id_sla",
+            "fl_breach",
+            "qt_tempo_restante_minutos",
+            "qt_tempo_decorrido_minutos",
+            "qt_meta_minutos",
+            "dt_referencia",
+            "dt_inclusao",
+            "dt_atualizacao",
+            "nm_sistema_origem",
+            "cd_registro_origem",
+        ],
+    )
+
+    popular_tabela_destino(
+        "chamados_status_historico",
+        "chamado_status_historico",
+        "id_chamado_status_historico",
+        [
+            "id_chamado_status_historico",
+            "id_chamado",
+            "ds_status_chamado",
+            "dt_inicio_status",
+            "dt_fim_status",
+            "qt_tempo_status_minutos",
+            "id_analista_responsavel",
+            "id_fila",
+            "dt_inclusao",
+            "dt_atualizacao",
+            "nm_sistema_origem",
+            "cd_registro_origem",
+        ],
+    )
+
+    popular_tabela_destino(
+        "csat_avaliacoes",
+        "csat_avaliacao",
+        "id_csat_avaliacao",
+        [
+            "id_csat_avaliacao",
+            "id_chamado",
+            "id_analista",
+            "nr_score",
+            "ds_comentario",
+            "dt_avaliacao",
+            "dt_inclusao",
+            "dt_atualizacao",
+            "nm_sistema_origem",
+            "cd_registro_origem",
+        ],
+    )
+
+    logging.info("Carga completa do banco de destino finalizada com sucesso.")
 
 
 # =========================================================
@@ -344,3 +791,25 @@ def extract_cliente_organizacao(
         "cliente_organizacao",
         "clientes_organizacao",
     )
+
+
+# =========================================================
+# CARGA DIÁRIA DO BANCO DE DESTINO
+# =========================================================
+
+
+@app.function_name(name="carga_diaria_banco_destino")
+@app.timer_trigger(
+    schedule="0 0 6 * * *",
+    arg_name="myTimer",
+    run_on_startup=False,
+    use_monitor=True,
+)
+def carga_diaria_banco_destino(
+    myTimer: func.TimerRequest,
+) -> None:
+    logging.info("Iniciando carga diária do banco de destino.")
+
+    popular_todas_tabelas()
+
+    logging.info("Carga diária do banco de destino concluída.")
